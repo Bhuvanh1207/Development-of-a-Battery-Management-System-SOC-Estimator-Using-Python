@@ -1,0 +1,229 @@
+# ============================================================
+# PROJECT 1: Battery SOC Estimator
+# This simulates what a real BMS does to track charge level
+# ============================================================
+
+# --- Import libraries ---
+import numpy as np
+import matplotlib.pyplot as plt
+from scipy.interpolate import interp1d
+
+# ============================================================
+# BATTERY SPECIFICATIONS
+# Based on: Samsung INR18650-25R Li-ion Cell
+# ============================================================
+
+# Full capacity of the cell in Ampere-hours (Ah)
+# This cell holds 2.5 Ah when brand new
+CAPACITY_AH = 2.5
+
+# Simulation time step — how often we "check" the battery
+# 1 second = we measure current every 1 second
+DT_SECONDS = 1
+
+# ============================================================
+# OCV vs SOC TABLE (Open Circuit Voltage lookup table)
+# Real data from Samsung 18650 datasheet
+# Left column  = SOC  (0.0 means 0%, 1.0 means 100%)
+# Right column = Voltage at that SOC (in Volts)
+# ============================================================
+
+OCV_SOC = np.array([
+    0.00, 0.10, 0.20, 0.30, 0.40,
+    0.50, 0.60, 0.70, 0.80, 0.90, 1.00
+])
+
+OCV_VOLTAGE = np.array([
+    3.00, 3.35, 3.50, 3.61, 3.70,
+    3.78, 3.85, 3.93, 4.00, 4.10, 4.20
+])
+
+# Build an interpolation function from the table
+# This lets us look up ANY voltage, not just the ones in our table
+# Like drawing a smooth curve through those 11 data points
+ocv_to_soc = interp1d(OCV_VOLTAGE, OCV_SOC,
+                       kind='linear',
+                       bounds_error=False,
+                       fill_value=(0.0, 1.0))
+
+print("✅ Battery data loaded successfully")
+print(f"   Cell capacity: {CAPACITY_AH} Ah")
+print(f"   OCV range: {OCV_VOLTAGE.min()}V (empty) to {OCV_VOLTAGE.max()}V (full)")
+# ============================================================
+# SIMULATE BATTERY DISCHARGE
+# We pretend the battery runs for 9000 seconds (~2.5 hours)
+# draining from 100% to 0%
+# ============================================================
+
+# Total simulation time: 9000 seconds = 2.5 hours
+TOTAL_SECONDS = 9000
+
+# Create a list of time points: 0, 1, 2, 3, ... 9000 seconds
+time_array = np.arange(0, TOTAL_SECONDS, DT_SECONDS)
+
+# --- True SOC (ground truth) ---
+# Start at 100%, drain linearly to 0% over 9000 seconds
+# This is the REAL answer we'll compare our estimates against
+true_soc = np.linspace(1.0, 0.0, len(time_array))
+
+# --- Simulated discharge current ---
+# Real batteries don't drain at exactly constant current
+# We add small random noise to make it realistic
+# Average current: 1A (drains 2.5 Ah battery in 2.5 hours)
+np.random.seed(42)  # Makes random numbers repeatable (same every run)
+current_array = 1.0 + np.random.normal(0, 0.05, len(time_array))
+current_array = np.clip(current_array, 0.8, 1.2)  # Keep within 0.8–1.2 A
+
+# --- Simulated voltage curve ---
+# Map the true SOC to voltage using our OCV table
+# Then add small random noise (sensors aren't perfect)
+soc_to_voltage = interp1d(OCV_SOC, OCV_VOLTAGE, kind='linear')
+voltage_array = soc_to_voltage(true_soc)
+voltage_array += np.random.normal(0, 0.01, len(time_array))  # ±10mV noise
+
+print(f"\n✅ Simulation data created")
+print(f"   Duration: {TOTAL_SECONDS/3600:.1f} hours")
+print(f"   Data points: {len(time_array)} readings")
+print(f"   Avg current: {current_array.mean():.3f} A")
+# ============================================================
+# ALGORITHM 1: COULOMB COUNTING
+# Track charge that flows out, subtract from starting SOC
+# Formula: SOC_new = SOC_old - (current × time) / capacity
+# ============================================================
+
+soc_coulomb = np.zeros(len(time_array))  # Array to store our estimates
+soc_coulomb[0] = 1.0  # Start at 100% — we know this at t=0
+
+for i in range(1, len(time_array)):
+    # Charge removed in this 1-second step (in Ah)
+    # current (A) × time (hours) = charge (Ah)
+    charge_removed = current_array[i] * (DT_SECONDS / 3600)
+
+    # Subtract from previous SOC estimate
+    soc_coulomb[i] = soc_coulomb[i-1] - (charge_removed / CAPACITY_AH)
+
+    # Keep SOC between 0 and 1 (0% to 100%)
+    soc_coulomb[i] = np.clip(soc_coulomb[i], 0.0, 1.0)
+
+# ============================================================
+# ALGORITHM 2: OCV LOOKUP
+# Use the measured voltage to look up SOC in our table
+# Simple but only accurate when current is very low (near rest)
+# ============================================================
+
+soc_ocv = ocv_to_soc(voltage_array)  # One line! The interp function does all the work
+
+# ============================================================
+# CALCULATE ERROR (how far off are we from truth?)
+# ============================================================
+
+error_coulomb = np.abs(soc_coulomb - true_soc) * 100  # Convert to %
+error_ocv     = np.abs(soc_ocv     - true_soc) * 100
+
+print(f"\n📊 Results:")
+print(f"   Coulomb Counting — Avg error: {error_coulomb.mean():.2f}%")
+print(f"   OCV Lookup       — Avg error: {error_ocv.mean():.2f}%")
+
+# ============================================================
+# PLOT EVERYTHING
+# Creates 2 graphs: SOC over time, and Error over time
+# ============================================================
+
+time_hours = time_array / 3600  # Convert seconds to hours for x-axis
+
+fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(12, 8))
+fig.patch.set_facecolor('#070B12')
+
+# --- Graph 1: SOC Estimates vs True SOC ---
+ax1.set_facecolor('#0D1520')
+ax1.plot(time_hours, true_soc * 100,
+         color='#ffffff', linewidth=2.5, label='True SOC (ground truth)', zorder=3)
+ax1.plot(time_hours, soc_coulomb * 100,
+         color='#00E5C0', linewidth=1.8, linestyle='--', label='Coulomb Counting estimate')
+ax1.plot(time_hours, soc_ocv * 100,
+         color='#F97316', linewidth=1.8, linestyle=':', label='OCV Lookup estimate')
+ax1.set_xlabel('Time (hours)', color='#4E6A88')
+ax1.set_ylabel('SOC (%)', color='#4E6A88')
+ax1.set_title('Battery State of Charge — Estimation vs Ground Truth', color='#DCE8F8', pad=12)
+ax1.legend(facecolor='#0D1520', labelcolor='#DCE8F8')
+ax1.tick_params(colors='#4E6A88')
+ax1.grid(True, alpha=0.15)
+ax1.set_ylim(-5, 105)
+
+# --- Graph 2: Estimation Error over time ---
+ax2.set_facecolor('#0D1520')
+ax2.plot(time_hours, error_coulomb,
+         color='#00E5C0', linewidth=1.5, label='Coulomb Counting error')
+ax2.plot(time_hours, error_ocv,
+         color='#F97316', linewidth=1.5, label='OCV Lookup error')
+ax2.axhline(y=2, color='#F43F5E', linestyle='--', alpha=0.7, label='2% error threshold')
+ax2.set_xlabel('Time (hours)', color='#4E6A88')
+ax2.set_ylabel('Absolute Error (%)', color='#4E6A88')
+ax2.set_title('Estimation Error Over Time', color='#DCE8F8', pad=12)
+ax2.legend(facecolor='#0D1520', labelcolor='#DCE8F8')
+ax2.tick_params(colors='#4E6A88')
+ax2.grid(True, alpha=0.15)
+
+plt.tight_layout(pad=2.0)
+plt.savefig('soc_results.png', dpi=150, bbox_inches='tight',
+            facecolor='#070B12')
+plt.show()
+print("\n✅ Graph saved as soc_results.png in your project folder")
+import csv
+
+# Save all data to a CSV file
+with open('soc_log.csv', 'w', newline='') as f:
+    writer = csv.writer(f)
+    writer.writerow(['Time_s', 'Voltage_V', 'Current_A',
+                     'True_SOC_%', 'Coulomb_SOC_%', 'OCV_SOC_%'])
+    for i in range(len(time_array)):
+        writer.writerow([
+            round(time_array[i], 1),
+            round(voltage_array[i], 4),
+            round(current_array[i], 4),
+            round(true_soc[i] * 100, 2),
+            round(soc_coulomb[i] * 100, 2),
+            round(soc_ocv[i] * 100, 2)
+        ])
+
+print("✅ Data saved to soc_log.csv — open in Excel to explore")
+# ============================================================
+# ALGORITHM 3: SIMPLE KALMAN FILTER
+# Combines Coulomb Counting (prediction) + OCV (correction)
+# ============================================================
+
+soc_kalman = np.zeros(len(time_array))
+soc_kalman[0] = 1.0  # Start fully charged
+
+# P = estimation uncertainty (starts high — we're not sure)
+P = 0.1
+
+# Q = process noise (how much we trust Coulomb Counting)
+Q = 1e-4
+
+# R = measurement noise (how much we trust the OCV reading)
+R = 0.01
+
+for i in range(1, len(time_array)):
+
+    # --- PREDICT (using Coulomb Counting) ---
+    charge_removed = current_array[i] * (DT_SECONDS / 3600)
+    soc_pred = soc_kalman[i-1] - charge_removed / CAPACITY_AH
+    P = P + Q  # Uncertainty grows when we predict
+
+    # --- UPDATE (using OCV measurement) ---
+    soc_measured = soc_ocv[i]  # OCV-based estimate
+
+    # Kalman Gain: how much to trust the measurement vs prediction
+    K = P / (P + R)
+
+    # Correct the prediction toward the measurement
+    soc_kalman[i] = soc_pred + K * (soc_measured - soc_pred)
+    P = (1 - K) * P  # Uncertainty shrinks after update
+
+    # Safety clamp
+    soc_kalman[i] = np.clip(soc_kalman[i], 0.0, 1.0)
+
+# Add Kalman to error calculation and plot
+error_kalman = np.abs(soc_kalman - true_soc) * 100
+print(f"   Kalman Filter     — Avg error: {error_kalman.mean():.2f}%")
